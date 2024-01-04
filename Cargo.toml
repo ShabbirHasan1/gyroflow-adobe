@@ -4,21 +4,26 @@ version = "0.0.1"
 authors = ["Adrian <adrian.eddy@gmail.com>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-build = "build.rs"
 
 [lib]
-name = "gyroflow_adobe"
 crate-type = ["cdylib"]
 
 [dependencies]
 after-effects = { path = "../after-effects" }
 after-effects-sys = { path = "../after-effects/after-effects-sys" }
-gyroflow-core = { git = "https://github.com/gyroflow/gyroflow.git", default-features = false, rev = "5794a7e", features = ["bundle-lens-profiles"] }
-cstr-literal = "0.1"
+#gyroflow-core = { git = "https://github.com/gyroflow/gyroflow.git", default-features = false, rev = "e0869ff", features = ["bundle-lens-profiles"] }
+gyroflow-core = { path = "../gyroflow/src/core", default-features = false, features = ["bundle-lens-profiles", "use-opencl"] }
 rfd = "0.12"
 log = "0.4"
 win_dbg_logger = "0.1"
 log-panics = "2.1"
+bincode = "1.3"
+lru = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+parking_lot = { version = "0.12", features = ["deadlock_detection"] }
+lazy_static = "1.4.0"
+fastrand = "2.0"
+pretty-hex = "0.4"
 
 [build-dependencies]
 pipl = { path = "../after-effects/pipl" }

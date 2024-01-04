@@ -1,166 +1,309 @@
-use after_effects_sys as ae_sys;
-use after_effects as ae;
-use cstr_literal::cstr;
-
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use gyroflow_core::{ StabilizationManager, filesystem, stabilization::{ RGBA8, RGBA16, RGBAf } };
 use gyroflow_core::gpu::{ BufferDescription, Buffers, BufferSource };
 
-#[repr(i32)]
-#[derive(Debug, PartialEq)]
-enum PluginParams {
-    InputLayer = 0,
-    // ArbitraryParam,
+use after_effects as ae;
+use after_effects_sys as ae_sys;
+
+use lru::LruCache;
+use parking_lot::Mutex;
+
+// We should cache managers globally because it's common to have the effect applied to the same clip and cut the clip into multiple pieces
+// We don't want to create a new manager for each piece of the same clip
+// Cache key is specific enough
+
+#[derive(Eq, PartialEq, Hash, Clone, Copy, Debug)]
+enum Params {
     BrowseButton,
     Smoothness,
     StabilizationOverview,
-    NumParams
 }
 
-#[derive(Default)]
+struct Plugin {
+    manager_cache: Mutex<LruCache<String, Arc<StabilizationManager>>>
+}
+impl Default for Plugin {
+    fn default() -> Self {
+        Self {
+            manager_cache: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(8).unwrap())),
+        }
+    }
+}
+impl Drop for Plugin {
+    fn drop(&mut self) {
+        log::info!("dropping plugin: {:?}", self as *const _);
+        {
+            let mut lock = self.manager_cache.lock();
+            for (_, v) in lock.iter() {
+                log::info!("arc count: {}", Arc::strong_count(v));
+            }
+            lock.clear();
+        }
+        log::info!("dropped plugin: {:?}", self as *const _);
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Instance {
     width: usize,
     height: usize,
-    stab: StabilizationManager,
     project_path: String,
 	smoothness: f32,
 	stab_overview: bool,
+
+    instance_id: String,
+    embedded_lens: String,
+    embedded_preset: String,
+
+    input_rotation: f64,
+    video_rotation: f64,
+
+    include_project_data: bool,
+    project_data: String,
+
+    original_video_size: (usize, usize),
+    original_output_size: (usize, usize),
+    num_frames: usize,
+    fps: f64,
+    ever_changed: bool,
+
+    #[serde(skip)]
+    gyrodata: Option<LruCache<String, Arc<StabilizationManager>>>,
 }
-/*impl Default for Instance {
+impl Default for Instance {
     fn default() -> Self {
-        let mut stab = StabilizationManager::default();
-        {
-            let mut stab = stab.stabilization.write();
-            stab.share_wgpu_instances = true;
-            stab.interpolation = gyroflow_core::stabilization::Interpolation::Lanczos4;
-        }
+        log::info!("new instance");
         Self {
-            stab,
-            ..Default::default()
+            width: 0,
+            height: 0,
+            project_path: String::new(),
+            smoothness: 50.0,
+            stab_overview: false,
+
+            instance_id: format!("{}", fastrand::u64(..)),
+            embedded_lens: String::new(),
+            embedded_preset: String::new(),
+
+            input_rotation: 0.0,
+            video_rotation: 0.0,
+
+            include_project_data: false,
+            project_data: String::new(),
+
+            original_video_size: (0, 0),
+            original_output_size: (0, 0),
+            num_frames: 0,
+            fps: 0.0,
+            ever_changed: true,
+
+            gyrodata: Some(LruCache::new(std::num::NonZeroUsize::new(8).unwrap())),
         }
     }
-}*/
+}
+
+ae::register_plugin!(Plugin, Instance, Params);
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        log::info!("dropping instance: {:?}", self as *const _);
+        self.gyrodata.as_mut().unwrap().clear();
+        //gyroflow_core::stabilization::clear_thread_local_cache();
+        log::info!("dropped instance: {:?}", self as *const _);
+    }
+}
+impl Instance {
+    fn open_gyroflow(&self) {
+        // TODO
+    }
+    fn update_loaded_state(&mut self, _enabled: bool) {
+        // TODO
+    }
+    fn gyrodata(&mut self, global: &Plugin, bit_depth: usize, input_rect: ae::Rect, output_rect: ae::Rect) -> Option<Arc<StabilizationManager>> {
+        let disable_stretch = false; // TODO
+
+        let in_size = (input_rect.width() as usize, input_rect.height() as usize);
+        let out_size = (output_rect.width() as usize, output_rect.height() as usize);
+
+        let instance_id = &self.instance_id;
+        let path = &self.project_path;
+        if path.is_empty() {
+            log::info!("no path!");
+            self.update_loaded_state(false);
+            return None;
+        }
+        let key = format!("{path}{bit_depth:?}{in_size:?}{out_size:?}{disable_stretch}{instance_id}");
+        let cloned = global.manager_cache.lock().get(&key).map(Arc::clone);
+        log::info!("key: {key}");
+        let stab = if let Some(stab) = cloned {
+            // Cache it in this instance as well
+            /*if !self.gyrodata.as_ref()?.contains(&key) {
+                self.gyrodata.as_mut()?.put(key.to_owned(), stab.clone());
+            }*/
+            stab
+        } else {
+            let mut stab = StabilizationManager::default();
+            {
+                // Find first lens profile database with loaded profiles
+                let lock = global.manager_cache.lock();
+                for (_, v) in lock.iter() {
+                    if v.lens_profile_db.read().loaded {
+                        stab.lens_profile_db = v.lens_profile_db.clone();
+                        break;
+                    }
+                }
+            }
+
+            if !path.ends_with(".gyroflow") {
+                match stab.load_video_file(&filesystem::path_to_url(&path), None) {
+                    Ok(md) => {
+                        if !self.embedded_lens.is_empty() {
+                            if let Err(e) = stab.load_lens_profile(&self.embedded_lens) {
+                                rfd::MessageDialog::new()
+                                    .set_description(&format!("Failed to load lens profile: {e:?}"))
+                                    .show();
+                            }
+                        }
+                        if !self.embedded_preset.is_empty() {
+                            let mut is_preset = false;
+                            if let Err(e) = stab.import_gyroflow_data(self.embedded_preset.as_bytes(), true, None, |_|(), Arc::new(AtomicBool::new(false)), &mut is_preset) {
+                                rfd::MessageDialog::new()
+                                    .set_description(&format!("Failed to load preset: {e:?}"))
+                                    .show();
+                            }
+                        }
+                        if self.include_project_data {
+                            if let Ok(data) = stab.export_gyroflow_data(gyroflow_core::GyroflowProjectType::WithGyroData, "{}", None) {
+                                self.project_data = data;
+                            }
+                        }
+                        if md.rotation != 0 {
+                            let r = ((360 - md.rotation) % 360) as f64;
+                            self.input_rotation = r;
+                            stab.params.write().video_rotation = r;
+                        }
+                    },
+                    Err(e) => {
+                        let embedded_data = &self.project_data;
+                        if !embedded_data.is_empty() {
+                            let mut is_preset = false;
+                            match stab.import_gyroflow_data(embedded_data.as_bytes(), true, None, |_|(), Arc::new(AtomicBool::new(false)), &mut is_preset) {
+                                Ok(_) => { },
+                                Err(e) => {
+                                    log::error!("load_gyro_data error: {}", &e);
+                                    self.update_loaded_state(false);
+                                }
+                            }
+                        } else {
+                            log::error!("An error occured: {e:?}");
+                            self.update_loaded_state(false);
+                            // self.param_status.set_label("Failed to load file info!")?;
+                            // self.param_status.set_hint(&format!("Error loading {path}: {e:?}."))?;
+                            return None;
+                        }
+                    }
+                }
+            } else {
+                let project_data = {
+                    if self.include_project_data && !self.project_data.is_empty() {
+                        self.project_data.clone()
+                    } else if let Ok(data) = std::fs::read_to_string(&path) {
+                        if self.include_project_data {
+                            self.project_data = data.clone();
+                        } else {
+                            self.project_data.clear();
+                        }
+                        data
+                    } else {
+                        String::new()
+                    }
+                };
+                let mut is_preset = false;
+                if let Err(e) = stab.import_gyroflow_data(project_data.as_bytes(), true, Some(&filesystem::path_to_url(&path)), |_|(), Arc::new(AtomicBool::new(false)), &mut is_preset) {
+                    log::error!("load_gyro_data error: {}", &e);
+                    self.update_loaded_state(false);
+                }
+            }
+
+            let loaded = {
+                stab.params.write().calculate_ramped_timestamps(&stab.keyframes.read(), false, true);
+                let params = stab.params.read();
+                self.original_video_size = params.video_size;
+                self.original_output_size = params.video_output_size;
+                self.num_frames = params.frame_count;
+                self.fps = params.fps;
+                let loaded = params.duration_ms > 0.0;
+                //if loaded && self.reload_values_from_project {
+                //    self.reload_values_from_project = false;
+                //    let smooth = stab.smoothing.read();
+                //    let smoothness = smooth.current().get_parameter("smoothness");
+                //}
+                loaded
+            };
+
+            self.update_loaded_state(loaded);
+
+            if disable_stretch {
+                stab.disable_lens_stretch();
+            }
+
+            stab.set_fov_overview(self.stab_overview);
+
+            let video_size = {
+                let mut params = stab.params.write();
+                params.framebuffer_inverted = false;
+                params.video_size
+            };
+
+            let org_ratio = video_size.0 as f64 / video_size.1 as f64;
+
+            let src_rect = get_center_rect(in_size.0, in_size.1, org_ratio);
+            stab.set_size(src_rect.2, src_rect.3);
+            stab.set_output_size(out_size.0, out_size.1);
+
+            {
+                let mut stab = stab.stabilization.write();
+                stab.share_wgpu_instances = true;
+                stab.interpolation = gyroflow_core::stabilization::Interpolation::Lanczos4;
+            }
+
+            stab.invalidate_smoothing();
+            stab.recompute_blocking();
+            //let inverse = !(self.keyframable_params.read().use_gyroflows_keyframes.get_value()? && stab.keyframes.read().is_keyframed_internally(&KeyframeType::VideoSpeed));
+            //stab.params.write().calculate_ramped_timestamps(&stab.keyframes.read(), inverse, inverse);
+
+            let stab = Arc::new(stab);
+            // Insert to static global cache
+            global.manager_cache.lock().put(key.to_owned(), stab.clone());
+            // Cache it in this instance as well
+            //self.gyrodata.as_mut()?.put(key.to_owned(), stab.clone());
+
+            stab
+        };
+
+        Some(stab)
+    }
+}
 
 impl Instance {
-    pub fn load_path(&mut self, path: &str) {
-        log::debug!("loading: {path}");
-        {
-            let mut stab = self.stab.stabilization.write();
-            stab.share_wgpu_instances = true;
-            stab.interpolation = gyroflow_core::stabilization::Interpolation::Lanczos4;
-        }
+    fn smart_render(&mut self, global: &Plugin, in_data: ae::pf::InData, extra: SmartRenderExtra, is_gpu: bool) -> Result<(), ae::Error> {
+        let cb = extra.callbacks();
+        if let Ok(input_world) = cb.checkout_layer_pixels(in_data.effect_ref(), 0) {
+            if let Ok(output_world) = cb.checkout_output(in_data.effect_ref()) {
+                if let Ok(world_suite) = ae::WorldSuite2::new() {
+                    let pixel_format = world_suite.get_pixel_format(input_world).unwrap();
+                    if is_gpu && pixel_format != ae::PixelFormat::GpuBgra128 {
+                        log::info!("GPU render requested but pixel format is not GpuBgra128");
+                        return Err(Error::UnrecogizedParameterType);
+                    }
+                    if let Some(stab) = extra.pre_render_data::<Arc<StabilizationManager>>() {
+                        log::info!("pixel_format: {pixel_format:?}, is_gpu: {is_gpu}, arc count: {}", Arc::strong_count(&stab));
+                        log::info!("smart_render: {}, size: {:?}", in_data.current_timestamp(), stab.params.read().size);
 
-        if !path.ends_with(".gyroflow") {
-            if let Err(e) = self.stab.load_video_file(&filesystem::path_to_url(&path), None) {
-                log::error!("An error occured: {e:?}");
-            }
-        } else {
-            if let Err(e) = self.stab.import_gyroflow_file(&filesystem::path_to_url(&path), true, |_|(), Arc::new(AtomicBool::new(false))) {
-                log::error!("import_gyroflow_file error: {e:?}");
-            }
-        }
-
-        let video_size = self.stab.params.read().video_size;
-
-        let org_ratio = video_size.0 as f64 / video_size.1 as f64;
-
-        let src_rect = get_center_rect(self.width, self.height, org_ratio);
-        self.stab.set_size(src_rect.2, src_rect.3);
-        self.stab.set_output_size(self.width, self.height);
-
-        self.stab.invalidate_smoothing();
-        self.stab.recompute_blocking();
-
-        self.project_path = path.to_owned();
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn PluginDataEntryFunction2(
-    in_ptr: ae_sys::PF_PluginDataPtr,
-    in_plugin_data_callback_ptr: ae_sys::PF_PluginDataCB2,
-    _in_sp_basic_suite_ptr: *const ae_sys::SPBasicSuite,
-    in_host_name: *const std::ffi::c_char,
-    in_host_version: *const std::ffi::c_char) -> ae_sys::PF_Err
-{
-    log::set_max_level(log::LevelFilter::Debug);
-    log::info!("PluginDataEntryFunction2: {:?}, {:?}", std::ffi::CStr::from_ptr(in_host_name), std::ffi::CStr::from_ptr(in_host_version));
-
-    if let Some(cb_ptr) = in_plugin_data_callback_ptr {
-        cb_ptr(in_ptr,
-            cstr!(env!("PIPL_NAME"))       .as_ptr() as *const u8, // Name
-            cstr!(env!("PIPL_MATCH_NAME")) .as_ptr() as *const u8, // Match Name
-            cstr!(env!("PIPL_CATEGORY"))   .as_ptr() as *const u8, // Category
-            cstr!(env!("PIPL_ENTRYPOINT")) .as_ptr() as *const u8, // Entry point
-            env!("PIPL_KIND")              .parse().unwrap(),
-            env!("PIPL_AE_SPEC_VER_MAJOR") .parse().unwrap(),
-            env!("PIPL_AE_SPEC_VER_MINOR") .parse().unwrap(),
-            env!("PIPL_AE_RESERVED")       .parse().unwrap(),
-            cstr!(env!("PIPL_SUPPORT_URL")).as_ptr() as *const u8, // Support url
-        )
-    } else {
-        ae_sys::PF_Err_INVALID_CALLBACK as ae_sys::PF_Err
-    }
-}
-
-fn write_str(ae_buffer: &mut [ae_sys::A_char], s: String) {
-    let buf = std::ffi::CString::new(s).unwrap().into_bytes_with_nul();
-    ae_buffer[0..buf.len()].copy_from_slice(unsafe { std::mem::transmute(buf.as_slice()) });
-}
-
-fn union_rect(src: &ae_sys::PF_LRect, dst: &mut ae_sys::PF_LRect) {
-    fn is_empty_rect(r: &ae_sys::PF_LRect) -> bool{
-        (r.left >= r.right) || (r.top >= r.bottom)
-    }
-	if is_empty_rect(dst) {
-		*dst = *src;
-	} else if !is_empty_rect(src) {
-		dst.left 	= dst.left.min(src.left);
-		dst.top  	= dst.top.min(src.top);
-		dst.right 	= dst.right.max(src.right);
-		dst.bottom  = dst.bottom.max(src.bottom);
-	}
-}
-unsafe fn pre_render(in_data: ae::pf::InDataHandle, extra: *mut ae_sys::PF_PreRenderExtra) -> ae_sys::PF_Err {
-	let req = (*(*extra).input).output_request;
-
-	(*(*extra).output).flags |= ae_sys::PF_RenderOutputFlag_GPU_RENDER_POSSIBLE as i16;
-
-    let pre_render_cb = ae::pf::PreRenderCallbacks::from_raw((*extra).cb);
-    if let Ok(in_result) = pre_render_cb.checkout_layer(in_data.effect_ref(), PluginParams::InputLayer as i32, 0, &req, in_data.current_time(), in_data.time_step(), in_data.time_scale()) {
-        union_rect(&in_result.result_rect,     &mut (*(*extra).output).result_rect);
-        union_rect(&in_result.max_result_rect, &mut (*(*extra).output).max_result_rect);
-    }
-
-	ae_sys::PF_Err_NONE as ae_sys::PF_Err
-}
-
-unsafe fn smart_render(in_data: ae::pf::InDataHandle, extra: *mut ae_sys::PF_SmartRenderExtra, is_gpu: bool) -> ae_sys::PF_Err {
-    let mut err = ae_sys::PF_Err_NONE as ae_sys::PF_Err;
-
-    let cb = ae::pf::SmartRenderCallbacks::from_raw((*extra).cb);
-    if let Ok(input_world) = cb.checkout_layer_pixels(in_data.effect_ref(), PluginParams::InputLayer as u32) {
-        if let Ok(output_world) = cb.checkout_output(in_data.effect_ref()) {
-            if let Ok(world_suite) = ae::WorldSuite2::new() {
-                let pixel_format = world_suite.get_pixel_format(input_world).unwrap();
-                log::info!("pixel_format: {pixel_format:?}, is_gpu: {is_gpu}");
-
-                let seq_ptr = ae::pf::EffectSequenceDataSuite1::new()
-                    .and_then(|x| x.get_const_sequence_data(in_data))
-                    .unwrap_or((*in_data.as_ptr()).sequence_data as *const _);
-
-                log::info!("smart_render: {}, seq_data: {:?}", in_data.current_timestamp(), seq_ptr);
-
-                if !seq_ptr.is_null() {
-                    let mut instance_handle = ae::pf::Handle::<Instance>::from_raw(seq_ptr as ae_sys::PF_Handle).unwrap();
-                    {
-                        let instance = instance_handle.lock().unwrap();
-                        let instance = instance.as_ref_mut().unwrap();
                         let timestamp_us = (in_data.current_timestamp() * 1_000_000.0).round() as i64;
 
                         let org_ratio = {
-                            let params = instance.stab.params.read();
+                            let params = stab.params.read();
                             params.video_size.0 as f64 / params.video_size.1 as f64
                         };
 
@@ -168,33 +311,67 @@ unsafe fn smart_render(in_data: ae::pf::InDataHandle, extra: *mut ae_sys::PF_Sma
                         let dest_size = (output_world.width(), output_world.height(), output_world.row_bytes());
                         let src_rect = get_center_rect(input_world.width(),  input_world.height(), org_ratio);
 
-                        if is_gpu {
-                            let what_gpu = (*(*extra).input).what_gpu;
-                            log::info!("Render API: {what_gpu}");
+                        let what_gpu = extra.what_gpu();
+                        log::info!("Render API: {what_gpu:?}, src_size: {src_size:?}, src_rect: {src_rect:?}, dest_size: {dest_size:?}");
 
+                        if is_gpu && !ae::pf::GPUDeviceSuite1::new().is_err() {
                             if let Ok(gpu_suite) = ae::pf::GPUDeviceSuite1::new() {
-                                let device_info = gpu_suite.get_device_info(in_data, (*(*extra).input).device_index).unwrap();
+                                let device_info = gpu_suite.get_device_info(in_data, extra.device_index())?;
 
-                                let what_gpu = (*(*extra).input).what_gpu;
-                                let in_ptr = gpu_suite.get_gpu_world_data(in_data, input_world).unwrap();
-                                let out_ptr = gpu_suite.get_gpu_world_data(in_data, output_world).unwrap();
+                                let in_ptr = gpu_suite.get_gpu_world_data(in_data, input_world)?;
+                                let out_ptr = gpu_suite.get_gpu_world_data(in_data, output_world)?;
 
-                                log::info!("Render GPU: {in_ptr:?} -> {out_ptr:?}. API: {what_gpu}");
+                                let mut buffers = Buffers {
+                                    input: BufferDescription {
+                                        size: src_size,
+                                        rect: Some(src_rect),
+                                        data: match what_gpu {
+                                            #[cfg(any(target_os = "macos", target_os = "ios"))]
+                                            ae::GpuFramework::Metal  => BufferSource::MetalBuffer { buffer: in_ptr, command_queue: device_info.command_queuePV },
+                                            ae::GpuFramework::OpenCl => BufferSource::OpenCL      { texture: in_ptr, queue: device_info.command_queuePV },
+                                            ae::GpuFramework::Cuda   => BufferSource::CUDABuffer  { buffer: in_ptr },
+                                            _ => panic!("Invalid GPU framework")
+                                        },
+                                        rotation: None,
+                                        texture_copy: true
+                                    },
+                                    output: BufferDescription {
+                                        size: dest_size,
+                                        rect: None,
+                                        data: match what_gpu {
+                                            #[cfg(any(target_os = "macos", target_os = "ios"))]
+                                            ae::GpuFramework::Metal  => BufferSource::MetalBuffer { buffer: out_ptr, command_queue: device_info.command_queuePV },
+                                            ae::GpuFramework::OpenCl => BufferSource::OpenCL      { texture: out_ptr, queue: std::ptr::null_mut() },
+                                            ae::GpuFramework::Cuda   => BufferSource::CUDABuffer  { buffer: out_ptr },
+                                            _ => panic!("Invalid GPU framework")
+                                        },
+                                        rotation: None,
+                                        texture_copy: true
+                                    }
+                                };
 
-                                match what_gpu {
-                                    ae_sys::PF_GPU_Framework_CUDA => {
+                                log::info!("Render GPU: {in_ptr:?} -> {out_ptr:?}. API: {what_gpu:?}, pixel_format: {pixel_format:?}");
+                                match pixel_format {
+                                    ae::PixelFormat::Argb32 => {
+                                        match stab.process_pixels::<RGBA8>(timestamp_us, &mut buffers) {
+                                            Ok(i)  => { log::info!("process_pixels ok: {i:?}"); },
+                                            Err(e) => { log::info!("process_pixels error: {e:?}"); }
+                                        }
                                     },
-                                    ae_sys::PF_GPU_Framework_OPENCL => {
+                                    ae::PixelFormat::GpuBgra128 => {
+                                        match stab.process_pixels::<RGBAf>(timestamp_us, &mut buffers) {
+                                            Ok(i)  => { log::info!("process_pixels ok: {i:?}"); },
+                                            Err(e) => { log::info!("process_pixels error: {e:?}"); }
+                                        }
                                     },
-                                    ae_sys::PF_GPU_Framework_METAL => {
-                                    },
-                                    _ => { }
+                                    _ => {
+                                        log::info!("Unhandled pixel format: {pixel_format:?}");
+                                    }
                                 }
+
                             } else {
                                 log::error!("Missing gpu suite");
                             }
-
-                            // err = smart_render_gpu(in_data, out_data, pixel_format, input_worldP, output_worldP, extraP, infoP);
                         } else {
                             let src = input_world.data_as_ptr_mut();
                             let dest = output_world.data_as_ptr_mut();
@@ -219,65 +396,182 @@ unsafe fn smart_render(in_data: ae::pf::InDataHandle, extra: *mut ae_sys::PF_Sma
                                 }
                             };
 
+                            log::info!("pixel_format: {pixel_format:?}");
                             match pixel_format {
-                                ae_sys::PF_PixelFormat_ARGB128 => {
-                                    log::debug!("PF_PixelFormat_ARGB128");
-                                    if let Err(e) = instance.stab.process_pixels::<RGBAf>(timestamp_us, &mut buffers) {
-                                        log::debug!("process_pixels error: {e:?}");
+                                ae::PixelFormat::Argb128 => {
+                                    if let Err(e) = stab.process_pixels::<RGBAf>(timestamp_us, &mut buffers) {
+                                        log::info!("process_pixels error: {e:?}");
                                     }
                                 },
-                                ae_sys::PF_PixelFormat_ARGB64 => {
-                                    log::debug!("PF_PixelFormat_ARGB64");
-                                    if let Err(e) = instance.stab.process_pixels::<RGBA16>(timestamp_us, &mut buffers) {
-                                        log::debug!("process_pixels error: {e:?}");
+                                ae::PixelFormat::Argb64 => {
+                                    if let Err(e) = stab.process_pixels::<RGBA16>(timestamp_us, &mut buffers) {
+                                        log::info!("process_pixels error: {e:?}");
                                     }
                                 },
-                                ae_sys::PF_PixelFormat_ARGB32 => {
-                                    log::debug!("PF_PixelFormat_ARGB32");
-                                    if let Err(e) = instance.stab.process_pixels::<RGBA8>(timestamp_us, &mut buffers) {
-                                        log::debug!("process_pixels error: {e:?}");
+                                ae::PixelFormat::Argb32 => {
+                                    if let Err(e) = stab.process_pixels::<RGBA8>(timestamp_us, &mut buffers) {
+                                        log::info!("process_pixels error: {e:?}");
                                     }
                                 },
                                 _ => {
-                                    log::info!("Unhandled pixel format: {pixel_format}");
+                                    log::info!("Unhandled pixel format: {pixel_format:?}");
                                 }
                             }
                         }
                     }
-                    std::mem::forget(instance_handle);
                 }
             }
+            log::info!("checkin_layer_pixels");
+            cb.checkin_layer_pixels(in_data.effect_ref(), 0).unwrap();
         }
-        cb.checkin_layer_pixels(in_data.effect_ref(), PluginParams::InputLayer as u32).unwrap();
+        Ok(())
     }
-
-    err
 }
 
-unsafe fn render(in_data: ae::pf::InDataHandle, params: *mut *mut ae_sys::PF_ParamDef, dest: *mut ae_sys::PF_LayerDef) -> ae_sys::PF_Err {
-    if &in_data.application_id() == b"PrMr" && !(*in_data.as_ptr()).sequence_data.is_null() {
-        let src = unsafe { &mut (*(*params.add(PluginParams::InputLayer as usize))).u.ld };
+impl AdobePluginGlobal for Plugin {
+    fn can_load(_host_name: &str, _host_version: &str) -> bool {
+        true
+    }
 
-        log::info!("pr render");
+    fn params_setup(&self, params: &mut ae::Parameters<Params>) -> Result<(), Error> {
+        // Project file
+        params.add_param_with_flags(Params::BrowseButton, "Project file or video", ButtonDef::new().label("Browse"), ParamFlag::SUPERVISE | ParamFlag::CANNOT_TIME_VARY);
 
-        let mut instance_handle = ae::pf::Handle::<Instance>::from_raw((*in_data.as_ptr()).sequence_data as ae_sys::PF_Handle).unwrap();
-        {
-            let instance = instance_handle.lock().unwrap();
-            let instance = instance.as_ref_mut().unwrap();
-            log::info!("render: {}", in_data.current_timestamp());
+        // Smoothness
+        params.add_param_with_flags(Params::Smoothness, "Smoothness", ae::FloatSliderDef::new()
+            .set_valid_min(0.0)
+            .set_slider_min(0.0)
+            .set_valid_max(100.0)
+            .set_slider_max(100.0)
+            .set_value(50.0)
+            .set_default(50.0)
+            .precision(1)
+            .display_flags(ValueDisplayFlag::NONE)
+        , ParamFlag::SUPERVISE);
+
+        // Stabilization overview
+        params.add_param_with_flags(Params::StabilizationOverview, "Stabilization overview", CheckBoxDef::new().label("ON"), ParamFlag::SUPERVISE);
+
+        Ok(())
+    }
+
+    fn handle_command(&self, cmd: ae::Command, in_data: ae::InData, mut out_data: ae::OutData) -> Result<(), ae::Error> {
+        let _ = log::set_logger(&win_dbg_logger::DEBUGGER_LOGGER);
+        log::set_max_level(log::LevelFilter::Debug);
+        log_panics::init();
+
+        log::info!("handle_command: {:?}, thread: {:?}, ptr: {:?}, effect_ref: {:?}", cmd, std::thread::current().id(), self as *const _, in_data.effect_ref().as_ptr());
+
+        match cmd {
+            ae::Command::About => {
+                out_data.set_return_msg("Gyroflow, v1.0\nCopyright 2023 AdrianEddy\rGyroflow plugin.");
+            }
+            ae::Command::GlobalSetup => {
+                if &in_data.application_id() == b"PrMr" {
+                    use ae::pr::PixelFormat::*;
+                    let pixel_format = ae::pf::PixelFormatSuite::new()?;
+                    pixel_format.clear_supported_pixel_formats(in_data.effect_ref())?;
+                    let supported_formats = [
+                        Bgra4444_8u,  Vuya4444_8u,  Vuya4444_8u709,  Argb4444_8u,  Bgrx4444_8u,  Vuyx4444_8u,  Vuyx4444_8u709,  Xrgb4444_8u,  Bgrp4444_8u,  Vuyp4444_8u,  Vuyp4444_8u709,  Prgb4444_8u,
+                        Bgra4444_16u, Vuya4444_16u,                  Argb4444_16u, Bgrx4444_16u,                                Xrgb4444_16u, Bgrp4444_16u,                                Prgb4444_16u,
+                        Bgra4444_32f, Vuya4444_32f, Vuya4444_32f709, Argb4444_32f, Bgrx4444_32f, Vuyx4444_32f, Vuyx4444_32f709, Xrgb4444_32f, Bgrp4444_32f, Vuyp4444_32f, Vuyp4444_32f709, Prgb4444_32f,
+                        Bgra4444_32fLinear, Bgrp4444_32fLinear, Bgrx4444_32fLinear, Argb4444_32fLinear, Prgb4444_32fLinear, Xrgb4444_32fLinear
+                    ];
+                    for x in supported_formats {
+                        pixel_format.add_pr_supported_pixel_format(in_data.effect_ref(), x)?;
+                    }
+                } else {
+                    out_data.add_out_flag2(ae_sys::PF_OutFlag2_SUPPORTS_GPU_RENDER_F32);
+                }
+                log::info!("added all flag");
+            }
+            ae::Command::GlobalSetdown => {
+                //self.manager_cache.lock().clear();
+            }
+            ae::Command::GpuDeviceSetup { extra } => {
+                let device_info = ae::pf::GPUDeviceSuite1::new().unwrap().get_device_info(in_data, extra.device_index())?;
+
+                let what_gpu = extra.what_gpu();
+
+                log::info!("Device info: {device_info:?}. GPU: {what_gpu:?}");
+
+                if what_gpu != ae::GpuFramework::None {
+                    out_data.add_out_flag2(ae_sys::PF_OutFlag2_SUPPORTS_GPU_RENDER_F32);
+                }
+            }
+            ae::Command::GpuDeviceSetdown { extra } => {
+                log::info!("gpu_device_setdown: {:?}", extra.what_gpu());
+            }
+
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl AdobePluginInstance for Instance {
+    fn flatten(&self) -> Result<Vec<u8>, Error> {
+        log::info!("flatten path: {}, ptr: {:?}", self.project_path, self as *const _);
+        Ok(bincode::serialize(self).unwrap())
+    }
+    fn unflatten(bytes: &[u8]) -> Result<Self, Error> {
+        let mut inst = bincode::deserialize::<Self>(bytes).unwrap();
+        inst.gyrodata = Some(LruCache::new(std::num::NonZeroUsize::new(8).unwrap()));
+        log::info!("unflatten path: {}, ptr: {:?}, bytes: {}", inst.project_path, &inst as *const _, pretty_hex::pretty_hex(&bytes));
+        Ok(inst)
+    }
+
+    fn user_changed_param(&mut self, global: &mut Plugin, param: Params, params: &mut ae::Parameters<Params>) -> Result<(), ae::Error> {
+        match param {
+            Params::BrowseButton => {
+                let mut d = rfd::FileDialog::new()
+                    .add_filter("Gyroflow project files", &["gyroflow"])
+                    .add_filter("Video files", &["mp4", "mov", "mxf", "braw", "r3d", "insv"]);
+                let current_path = &self.project_path;
+                if !current_path.is_empty() {
+                    if let Some(path) = std::path::Path::new(current_path).parent() {
+                        d = d.set_directory(path);
+                    }
+                }
+                if let Some(d) = d.pick_file() {
+                    self.project_path = d.display().to_string();
+                    log::info!("path: {}", self.project_path);
+                    params.get_param_def(Params::BrowseButton).set_value_has_changed();
+                }
+            }
+            Params::Smoothness => {
+                let val = params.get_float_slider(Params::Smoothness).value();
+                self.smoothness = val as f32;
+            }
+            Params::StabilizationOverview => {
+                let val = params.get_checkbox(Params::StabilizationOverview).value();
+                self.stab_overview = val;
+            }
+        }
+        log::info!("PF_Cmd_USER_CHANGED_PARAM: {} {}", self.smoothness, self.stab_overview);
+
+        Ok(())
+    }
+
+    fn render(&self, global: &Plugin, in_data: ae::InData, src: &Layer, dst: &mut Layer, _params: &ae::Parameters<Params>) -> Result<(), ae::Error> {
+        log::info!("render: {}", in_data.current_timestamp());
+
+        if let Some(stab) = in_data.frame_data::<Arc<StabilizationManager>>() {
             let timestamp_us = (in_data.current_timestamp() * 1_000_000.0).round() as i64;
 
             let org_ratio = {
-                let params = instance.stab.params.read();
+                let params = stab.params.read();
                 params.video_size.0 as f64 / params.video_size.1 as f64
             };
 
-            let src_size = ((*src).width as usize, (*src).height as usize, (*src).rowbytes as usize);
-            let dest_size = ((*dest).width as usize, (*dest).height as usize, (*dest).rowbytes as usize);
-            let src_rect = get_center_rect((*src).width as usize, (*src).height as usize, org_ratio);
+            let src_size  = (src.width() as usize, src.height() as usize, src.stride().abs() as usize);
+            let dest_size = (dst.width() as usize, dst.height() as usize, dst.stride().abs() as usize);
+            let src_rect = get_center_rect(src_size.0, src_size.1, org_ratio);
 
-            let inframe  = unsafe { std::slice::from_raw_parts_mut((*src).data as *mut u8, src_size.1 * src_size.2) };
-            let outframe = unsafe { std::slice::from_raw_parts_mut((*dest).data as *mut u8, dest_size.1 * dest_size.2) };
+            log::info!("org_ratio: {org_ratio:?}, src_size: {src_size:?}, src_rect: {src_rect:?}, dest_size: {dest_size:?}, src.stride: {}", src.stride());
+
+            let inframe  = unsafe { std::slice::from_raw_parts_mut(src.buffer().as_ptr() as *mut u8, src.buffer().len()) };
+            let outframe = unsafe { std::slice::from_raw_parts_mut(dst.buffer().as_ptr() as *mut u8, dst.buffer().len()) };
 
             let mut buffers = Buffers {
                 input: BufferDescription {
@@ -296,248 +590,73 @@ unsafe fn render(in_data: ae::pf::InDataHandle, params: *mut *mut ae_sys::PF_Par
                 }
             };
 
-            if let Err(e) = instance.stab.process_pixels::<RGBAf>(timestamp_us, &mut buffers) {
-                log::debug!("process_pixels error: {e:?}");
+            if let Err(e) = stab.process_pixels::<RGBA8>(timestamp_us, &mut buffers) {
+                log::info!("process_pixels error: {e:?}");
             }
         }
-        std::mem::forget(instance_handle);
-	}
-    ae_sys::PF_Err_NONE as ae_sys::PF_Err
-}
 
-/////////////////////////////////////////////////// GPU ///////////////////////////////////////////////////
-
-unsafe fn gpu_device_setup(in_data: ae::pf::InDataHandle, out_data: *mut ae_sys::PF_OutData, extra: *mut ae_sys::PF_GPUDeviceSetupExtra) -> ae_sys::PF_Err {
-    let device_info = ae::pf::GPUDeviceSuite1::new().unwrap().get_device_info(in_data, (*(*extra).input).device_index).unwrap();
-
-    let what_gpu = (*(*extra).input).what_gpu;
-
-    log::info!("Device info: {device_info:?}. GPU: {what_gpu}");
-
-    match what_gpu {
-        ae_sys::PF_GPU_Framework_CUDA => {
-            //(*out_data).out_flags2 |= ae_sys::PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
-        },
-        ae_sys::PF_GPU_Framework_OPENCL => {
-            //(*out_data).out_flags2 |= ae_sys::PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
-        },
-        ae_sys::PF_GPU_Framework_METAL => {
-            //(*out_data).out_flags2 |= ae_sys::PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
-        },
-        _ => { }
+        Ok(())
     }
 
-    ae_sys::PF_Err_NONE as ae_sys::PF_Err
-}
+    fn handle_command(&mut self, global: &mut Plugin, cmd: ae::Command, mut in_data: ae::InData, mut out_data: ae::OutData) -> Result<(), ae::Error> {
+        log::info!("sequence command: {:?}, thread: {:?}, ptr: {:?}", cmd, std::thread::current().id(), self as *const _);
 
-unsafe fn gpu_device_setdown(in_data: ae::pf::InDataHandle, out_data: *mut ae_sys::PF_OutData, extra: *mut ae_sys::PF_GPUDeviceSetdownExtra) -> ae_sys::PF_Err {
-    let what_gpu = (*(*extra).input).what_gpu;
-
-    log::info!("gpu_device_setdown: {what_gpu}");
-
-    ae_sys::PF_Err_NONE as ae_sys::PF_Err
-}
-
-/////////////////////////////////////////////////// GPU ///////////////////////////////////////////////////
-
-#[no_mangle]
-pub unsafe extern "C" fn EffectMain(
-    cmd: ae_sys::PF_Cmd,
-    in_data_ptr: *const ae_sys::PF_InData,
-    out_data: *mut ae_sys::PF_OutData,
-    params: *mut *mut ae_sys::PF_ParamDef,
-    output: *mut ae_sys::PF_LayerDef,
-    extra: *mut std::ffi::c_void) -> ae_sys::PF_Err
-{
-    let _pica = ae::PicaBasicSuite::from_pf_in_data_raw(in_data_ptr);
-
-    let _ = log::set_logger(&win_dbg_logger::DEBUGGER_LOGGER);
-    log::set_max_level(log::LevelFilter::Debug);
-
-
-    let in_data = ae::pf::InDataHandle::from_raw(in_data_ptr);
-    log::info!("[{:?}]: {:?} {}x{}", std::thread::current().id(), ae::pf::Command::try_from(cmd).unwrap(), in_data.width(), in_data.height());
-
-    let mut err = ae_sys::PF_Err_NONE as ae_sys::PF_Err;
-
-    log::info!("cmd: {cmd}, in seq: {:?}, out seq: {:?}", (*in_data_ptr).sequence_data, (*out_data).sequence_data);
-    match cmd as ae::EnumIntType {
-        ae_sys::PF_Cmd_ABOUT => {
-            write_str(&mut (*out_data).return_msg,
-                format!("Gyroflow, v1.0\nCopyright 2023 AdrianEddy\rGyroflow plugin.")
-            );
-        },
-        ae_sys::PF_Cmd_USER_CHANGED_PARAM => {
-            let extra = extra as *const ae_sys::PF_UserChangedParamExtra;
-            if !(*in_data_ptr).sequence_data.is_null() {
-                if (*extra).param_index > 0 && (*extra).param_index < PluginParams::NumParams as i32 {
-                    let mut instance_handle = ae::pf::Handle::<Instance>::from_raw((*in_data_ptr).sequence_data as ae_sys::PF_Handle).unwrap();
-                    {
-                        let instance = instance_handle.lock().unwrap();
-                        let instance = instance.as_ref_mut().unwrap();
-                        let param = std::mem::transmute((*extra).param_index);
-                        if param == PluginParams::BrowseButton {
-                            let mut d = rfd::FileDialog::new()
-                                .add_filter("Gyroflow project files", &["gyroflow"])
-                                .add_filter("Video files", &["mp4", "mov", "mxf", "braw", "r3d", "insv"]);
-                            let current_path = &instance.project_path;
-                            if !current_path.is_empty() {
-                                if let Some(path) = std::path::Path::new(current_path).parent() {
-                                    d = d.set_directory(path);
-                                }
-                            }
-                            if let Some(d) = d.pick_file() {
-                                instance.load_path(&d.display().to_string());
-                            }
-                        } else {
-                            match (param, ae::pf::ParamDef::from_raw(in_data_ptr, unsafe { *params.add((*extra).param_index as usize) }).to_param()) {
-                                (PluginParams::Smoothness, ae::Param::FloatSlider(p))  => {
-                                    instance.smoothness = p.value() as f32;
-                                    instance.stab.smoothing.write().current_mut().set_parameter("smoothness", instance.smoothness as f64);
-                                    instance.stab.invalidate_smoothing();
-                                    instance.stab.recompute_blocking();
-                                },
-                                (PluginParams::StabilizationOverview, ae::Param::CheckBox(p))  => {
-                                    instance.stab_overview = p.value();
-                                    instance.stab.set_fov_overview(instance.stab_overview);
-                                    instance.stab.recompute_undistortion();
-                                },
-                                _ => { }
-                            }
+        match cmd {
+            ae::Command::UserChangedParam { .. } => {
+                out_data.set_force_rerender();
+            }
+            ae::Command::SequenceSetup | ae::Command::SequenceResetup => {
+                if let Ok(interface_suite) = ae::aegp::PFInterfaceSuite::new() {
+                    if let Ok(layer_suite) = ae::aegp::LayerSuite::new() {
+                        if let Ok(footage_suite) = ae::aegp::FootageSuite::new() {
+                            let layer = interface_suite.effect_layer(in_data.effect_ref())?;
+                            let item = layer_suite.layer_source_item(layer)?;
+                            let footage = footage_suite.main_footage_from_item(item)?;
+                            log::info!("footage path: {:?}", footage_suite.footage_path(footage, 0, 0));
                         }
-                        log::info!("PF_Cmd_USER_CHANGED_PARAM: {} {}", instance.smoothness, instance.stab_overview);
                     }
+                }
+            },
+            ae::Command::SmartPreRender { mut extra } => {
+                let what_gpu = extra.what_gpu();
+                let req = extra.output_request();
 
-                    std::mem::forget(instance_handle);
+                if what_gpu != ae::GpuFramework::None {
+                    extra.set_gpu_render_possible(true);
+                }
+
+                let cb = extra.callbacks();
+                if let Ok(in_result) = cb.checkout_layer(in_data.effect_ref(), 0, 0, &req, in_data.current_time(), in_data.time_step(), in_data.time_scale()) {
+                    let      result_rect = extra.union_result_rect(in_result.result_rect.into());
+                    let _max_result_rect = extra.union_max_result_rect(in_result.max_result_rect.into());
+
+                    if let Some(stab) = self.gyrodata(global, 8, result_rect, result_rect) {
+                        stab.set_fov_overview(self.stab_overview);
+                        stab.recompute_undistortion();
+                        log::info!("setting pre-render extra: {result_rect:?}, in: {:?}, stab_overview: {}", in_data.extent_hint(), self.stab_overview);
+                        extra.set_pre_render_data::<Arc<StabilizationManager>>(stab);
+                    }
                 }
             }
-
-            log::info!("PF_Cmd_USER_CHANGED_PARAM: {}", (*extra).param_index);
-        },
-        ae_sys::PF_Cmd_SEQUENCE_SETUP => {
-            log::info!("setup");
-            let mut instance = Instance::default();
-            instance.width = in_data.width() as usize;
-            instance.height = in_data.height() as usize;
-
-            (*out_data).sequence_data = ae::pf::Handle::into_raw(ae::pf::Handle::new(instance).unwrap()) as *mut _;
-            log::debug!("setting sequence_data: {:?}", (*out_data).sequence_data);
-        },
-        ae_sys::PF_Cmd_SEQUENCE_RESETUP => {
-            log::info!("RESETUP: {:?} | {:?}", (*in_data_ptr).sequence_data, (*out_data).sequence_data);
-            if !(*in_data_ptr).sequence_data.is_null() {
-                let instance = ae::pf::FlatHandle::from_raw((*in_data_ptr).sequence_data as ae_sys::PF_Handle).unwrap();
-                let _lock = instance.lock().unwrap();
-                let bytes = instance.as_slice().unwrap();
-                if let Ok(path) = String::from_utf8(bytes.to_vec()) {
-
-                    log::info!("resetup serialized: {path}");
-                    let path = path.strip_prefix("path:").unwrap_or_default();
-
-                    let mut instance = Instance::default();
-                    instance.width = in_data.width() as usize;
-                    instance.height = in_data.height() as usize;
-                    instance.load_path(&path);
-
-                    (*out_data).sequence_data = ae::pf::Handle::into_raw(ae::pf::Handle::new(instance).unwrap()) as *mut _;
-                    log::debug!("setting sequence_data: {:?}", (*out_data).sequence_data);
+            ae::Command::FrameSetup { out_layer, .. } => {
+                if let Some(stab) = self.gyrodata(global, 8, in_data.extent_hint(), out_layer.extent_hint()) {
+                    out_data.set_frame_data::<Arc<StabilizationManager>>(stab);
                 }
-            } else {
-                (*out_data).sequence_data = std::ptr::null_mut();
             }
-        },
-        ae_sys::PF_Cmd_SEQUENCE_FLATTEN => {
-            log::info!("FLATTEN: {:?}", (*in_data_ptr).sequence_data);
-            if !(*in_data_ptr).sequence_data.is_null() {
-                let mut instance_handle = ae::pf::Handle::<Instance>::from_raw((*in_data_ptr).sequence_data as ae_sys::PF_Handle).unwrap();
-                {
-                    let instance = instance_handle.lock().unwrap();
-                    let instance = instance.as_ref().unwrap();
-
-                    let serialized = format!("path:{}", instance.project_path).as_bytes().to_vec();
-
-                    (*out_data).sequence_data = ae::pf::FlatHandle::into_raw(ae::pf::FlatHandle::new(serialized).unwrap()) as *mut _;
-                    log::info!("FLATTEN set: {:?}", (*out_data).sequence_data);
-                }
-                std::mem::forget(instance_handle);
-            } else {
-                (*out_data).sequence_data = std::ptr::null_mut();
+            ae::Command::FrameSetdown => {
+                in_data.destroy_frame_data::<Arc<StabilizationManager>>();
             }
-        },
-        ae_sys::PF_Cmd_SEQUENCE_SETDOWN => {
-            log::info!("SETDOWN: {:?}", (*in_data_ptr).sequence_data);
-            if !(*in_data_ptr).sequence_data.is_null() {
-                ae::pf::Handle::<Instance>::from_raw((*in_data_ptr).sequence_data as ae_sys::PF_Handle).unwrap();
+            ae::Command::SmartRender { extra } => {
+                self.smart_render(global, in_data, extra, false)?;
             }
-        },
-        ae_sys::PF_Cmd_GLOBAL_SETUP => {
-            log_panics::init();
-
-            (*out_data).my_version = env!("PIPL_VERSION").parse().unwrap();
-            (*out_data).out_flags  = env!("PIPL_OUTFLAGS").parse().unwrap();
-            (*out_data).out_flags2 = env!("PIPL_OUTFLAGS2").parse().unwrap();
-
-            if &in_data.application_id() == b"PrMr" {
-                let pixel_format = ae::pf::PixelFormatSuite::new().unwrap();
-                pixel_format.clear_supported_pixel_formats(in_data.effect_ref()).unwrap();
-                pixel_format.add_supported_pixel_format(in_data.effect_ref(), ae_sys::PrPixelFormat_PrPixelFormat_VUYA_4444_32f).unwrap();
-            } else {
-                //(*out_data).out_flags2 |= ae_sys::PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
+            ae::Command::SmartRenderGpu { extra } => {
+                self.smart_render(global, in_data, extra, true)?;
             }
-        },
-        ae_sys::PF_Cmd_PARAMS_SETUP => {
-            use ae::*;
-            //let mut arb = ArbitraryDef::new();
-            //ParamDef::new(in_data).name("data").param(Param::Arbitrary(arb)).add(-1);
-
-	        // Project file
-            let mut btn = ButtonDef::new();
-            btn.label("Browse");
-            ParamDef::new(in_data).name("Project file or video").flags(ParamFlag::SUPERVISE).param(Param::Button(btn)).add(-1);
-
-	        // Smoothness
-            ParamDef::new(in_data).name("Smoothness").flags(ParamFlag::SUPERVISE).param(Param::FloatSlider(*FloatSliderDef::new()
-                .set_valid_min(0.0)
-                .set_slider_min(0.0)
-                .set_valid_max(100.0)
-                .set_slider_max(100.0)
-                .set_value(50.0)
-                .set_default(50.0)
-                .precision(1)
-                .display_flags(ValueDisplayFlag::NONE)
-            )).add(-1);
-
-	        // Stabilization overview
-            let mut cb = CheckBoxDef::new();
-            cb.label("ON");
-            ParamDef::new(in_data).name("Stabilization overview").flags(ParamFlag::SUPERVISE).param(Param::CheckBox(cb)).add(-1);
-
-            (*out_data).num_params = PluginParams::NumParams as i32;
-        },
-        ae_sys::PF_Cmd_GPU_DEVICE_SETUP => {
-            err = gpu_device_setup(in_data, out_data, extra as *mut ae_sys::PF_GPUDeviceSetupExtra);
-        },
-        ae_sys::PF_Cmd_GPU_DEVICE_SETDOWN => {
-            err = gpu_device_setdown(in_data, out_data, extra as *mut ae_sys::PF_GPUDeviceSetdownExtra);
-        },
-        ae_sys::PF_Cmd_RENDER => {
-            err = render(in_data, params, output);
-        },
-        ae_sys::PF_Cmd_SMART_PRE_RENDER => {
-            err = pre_render(in_data, extra as *mut ae_sys::PF_PreRenderExtra);
-        },
-        ae_sys::PF_Cmd_SMART_RENDER => {
-            err = smart_render(in_data, extra as *mut ae_sys::PF_SmartRenderExtra, false);
-        },
-        ae_sys::PF_Cmd_SMART_RENDER_GPU => {
-            err = smart_render(in_data, extra as *mut ae_sys::PF_SmartRenderExtra, true);
-        },
-        _ => {
-            log::debug!("Unknown cmd: {cmd:?}");
+            _ => { }
         }
-    }
 
-    err
+        Ok(())
+    }
 }
 
 fn get_center_rect(width: usize, height: usize, org_ratio: f64) -> (usize, usize, usize, usize) {
